@@ -1,0 +1,14 @@
+services:
+  alphaction:
+    build: .
+    image: alphaction:latest
+    container_name: alphaction
+    runtime: nvidia
+    shm_size: '8gb'  # <--- ADD THIS LINE HERE
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    volumes:
+      - ./AlphactionFramework:/workspace/AlphAction  # Mount local code
+    stdin_open: true
+    tty: true
