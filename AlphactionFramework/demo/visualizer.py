@@ -1,535 +1,420 @@
+"""
+AVAVisualizer — modernised, threading-based.
+
+Compatible with Python 3.9+, PyTorch 2.x, Pillow 10+.
+Uses queue.Queue and threading.Thread throughout (no multiprocessing).
+Pillow 10+ API: textbbox() replaces removed textsize().
+"""
+
+from __future__ import annotations
+
+import queue
+import threading
+from typing import Dict, List, Optional, Tuple
+
 import cv2
-import torch
 import numpy as np
+import torch
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
-from PIL import Image, ImageFont, ImageDraw
-import torch.multiprocessing as mp
 
 cv2.setNumThreads(0)
 
-def cv2_video_info(video_path):
-    vid = cv2.VideoCapture(video_path)
-    width = vid.get(cv2.CAP_PROP_FRAME_WIDTH)
-    height = vid.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    fps = vid.get(cv2.CAP_PROP_FPS)
-    frame_num = vid.get(cv2.CAP_PROP_FRAME_COUNT)
-    vid.release()
-    return dict(
-        width=int(width),
-        height=int(height),
-        fps=fps,
-        frame_num=int(frame_num),
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _video_info(path: str | int) -> Dict:
+    cap = cv2.VideoCapture(path)
+    info = dict(
+        width    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        height   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        fps      = cap.get(cv2.CAP_PROP_FPS),
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+    )
+    cap.release()
+    return info
+
+
+def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> Tuple[int, int]:
+    """Return (width, height) of *text* — works on Pillow 8, 9, and 10+."""
+    if hasattr(draw, "textbbox"):
+        l, t, r, b = draw.textbbox((0, 0), text, font=font)
+        return r - l, b - t
+    else:
+        # Pillow < 10: textsize() still available
+        return draw.textsize(text, font=font)
+
+
+def _ms_to_timestamp(ms: float) -> str:
+    ms    = int(ms)
+    msec  = ms % 1000
+    ms  //= 1000
+    sec   = ms % 60
+    ms  //= 60
+    mins  = ms % 60
+    hrs   = ms // 60
+    return f"{hrs:02d}:{mins:02d}:{sec:02d}.{msec:03d}"
+
+
+# ---------------------------------------------------------------------------
+# AVAVisualizer
+# ---------------------------------------------------------------------------
+
+class AVAVisualizer:
+    """
+    Reads the original video frame-by-frame, composites bounding boxes and
+    action labels, and writes the annotated video to *output_path*.
+
+    In non-realtime mode three background threads handle:
+      1. Frame loading      (_load_frames)
+      2. Frame writing      (_write_frames)
+    Communication happens via standard queue.Queue objects.
+    """
+
+    # ── Category tables ───────────────────────────────────────────────────
+
+    CATEGORIES: List[str] = [
+        "bend/bow", "crawl", "crouch/kneel", "dance", "fall down",
+        "get up", "jump/leap", "lie/sleep", "martial art", "run/jog",
+        "sit", "stand", "swim", "walk",
+        "answer phone", "brush teeth", "carry/hold sth.", "catch sth.",
+        "chop", "climb", "clink glass", "close", "cook", "cut", "dig",
+        "dress/put on clothing", "drink", "drive", "eat", "enter", "exit",
+        "extract", "fishing", "hit sth.", "kick sth.", "lift/pick up",
+        "listen to sth.", "open", "paint", "play board game",
+        "play musical instrument", "play with pets", "point to sth.",
+        "press", "pull sth.", "push sth.", "put down", "read", "ride",
+        "row boat", "sail boat", "shoot", "shovel", "smoke", "stir",
+        "take a photo", "look at a cellphone", "throw", "touch sth.",
+        "turn", "watch screen", "work on a computer", "write",
+        "fight/hit sb.", "give/serve sth. to sb.", "grab sb.", "hand clap",
+        "hand shake", "hand wave", "hug sb.", "kick sb.", "kiss sb.",
+        "lift sb.", "listen to sb.", "play with kids", "push sb.", "sing",
+        "take sth. from sb.", "talk", "watch sb.",
+    ]
+
+    COMMON_CATES: List[str] = [
+        "dance", "run/jog", "sit", "stand", "swim", "walk",
+        "answer phone", "carry/hold sth.", "drive",
+        "play musical instrument", "ride",
+        "fight/hit sb.", "listen to sb.", "talk", "watch sb.",
+    ]
+
+    EXCLUSION: List[str] = [
+        "crawl", "brush teeth", "catch sth.", "chop", "clink glass", "cook",
+        "dig", "exit", "extract", "fishing", "kick sth.", "paint",
+        "play board game", "play with pets", "press", "row boat", "shovel",
+        "stir", "kick sb.", "play with kids",
+    ]
+
+    # Colours (R, G, B) for the three action category groups
+    COLORS: Tuple[Tuple[int, ...], ...] = (
+        (176, 85, 234),   # movement
+        (87, 118, 198),   # object interaction
+        (52, 189, 199),   # social
     )
 
+    # ── Init ──────────────────────────────────────────────────────────────
 
-class AVAVisualizer(object):
-    # category names are modified for better visualization
-    CATEGORIES = [
-        "bend/bow",
-        "crawl", #
-        "crouch/kneel",
-        "dance",
-        "fall down",
-        "get up",
-        "jump/leap",
-        "lie/sleep",
-        "martial art",
-        "run/jog",
-        "sit",
-        "stand",
-        "swim",
-        "walk",
-        "answer phone",
-        "brush teeth", #
-        "carry/hold sth.",
-        "catch sth.", #
-        "chop", #
-        "climb",
-        "clink glass", #
-        "close",
-        "cook", #
-        "cut",
-        "dig", #
-        "dress/put on clothing",
-        "drink",
-        "drive",
-        "eat",
-        "enter",
-        "exit", #
-        "extract", #
-        "fishing", #
-        "hit sth.",
-        "kick sth.", #
-        "lift/pick up",
-        "listen to sth.",
-        "open",
-        "paint", #
-        "play board game", #
-        "play musical instrument",
-        "play with pets", #
-        "point to sth.",
-        "press", #
-        "pull sth.",
-        "push sth.",
-        "put down",
-        "read",
-        "ride",
-        "row boat", #
-        "sail boat",
-        "shoot",
-        "shovel", #
-        "smoke",
-        "stir", #
-        "take a photo",
-        "look at a cellphone",
-        "throw",
-        "touch sth.",
-        "turn",
-        "watch screen",
-        "work on a computer",
-        "write",
-        "fight/hit sb.",
-        "give/serve sth. to sb.",
-        "grab sb.",
-        "hand clap",
-        "hand shake",
-        "hand wave",
-        "hug sb.",
-        "kick sb.", #
-        "kiss sb.",
-        "lift sb.",
-        "listen to sb.",
-        "play with kids", #
-        "push sb.",
-        "sing",
-        "take sth. from sb.",
-        "talk",
-        "watch sb.",
-    ]
-    COMMON_CATES = [
-        'dance',
-        'run/jog',
-        'sit',
-        'stand',
-        'swim',
-        'walk',
-        'answer phone',
-        'carry/hold sth.',
-        'drive',
-        'play musical instrument',
-        'ride',
-        'fight/hit sb.',
-        'listen to sb.',
-        'talk',
-        'watch sb.'
-    ]
-    EXCLUSION = [
-        "crawl",
-        "brush teeth",
-        "catch sth.",
-        "chop",
-        "clink glass",
-        "cook",
-        "dig",
-        "exit",
-        "extract",
-        "fishing",
-        "kick sth.",
-        "paint",
-        "play board game",
-        "play with pets",
-        "press",
-        "row boat",
-        "shovel",
-        "stir",
-        "kick sb.",
-        "play with kids",
-    ]
     def __init__(
-            self,
-            video_path,
-            output_path,
-            realtime,
-            start,
-            duration,
-            show_time,
-            confidence_threshold=0.5,
-            exclude_class=None,
-            common_cate=False,
-    ):
-        self.vid_info = cv2_video_info(video_path)
-        fps = self.vid_info["fps"]
+        self,
+        input_path:           str | int,
+        output_path:          str,
+        realtime:             bool,
+        start:                int,
+        duration:             int,
+        show_time:            bool,
+        confidence_threshold: float = 0.5,
+        exclude_class:        Optional[List[str]] = None,
+        common_cate:          bool = False,
+    ) -> None:
+        self.info      = _video_info(input_path)
+        self.realtime  = realtime
+        self.start     = start
+        self.duration  = duration
+        self.show_time = show_time
+        self.thresh    = confidence_threshold
+
+        fps = self.info["fps"]
         if fps == 0 or fps > 100:
-            print(
-                "Warning: The detected frame rate {} could be wrong. The behavior of this demo code can be abnormal.".format(
-                    fps))
+            print(f"Warning: suspicious frame rate {fps} — output may be wrong.")
 
-        self.realtime = realtime
-        self.start = start
-        self.duration = duration
-        self.show_time =  show_time
-        self.confidence_threshold = confidence_threshold
+        # Category setup
         if common_cate:
-            self.cate_to_show = self.COMMON_CATES
-            self.category_split = (6, 11)
+            self.cate_list     = self.COMMON_CATES
+            self.cat_split     = (6, 11)
         else:
-            self.cate_to_show = self.CATEGORIES
-            self.category_split = (14, 63)
-        self.cls2label = {class_name: i for i, class_name in enumerate(self.cate_to_show)}
-        if exclude_class is None:
-            exclude_class = self.EXCLUSION
-        self.exclude_id = [self.cls2label[cls_name] for cls_name in exclude_class if cls_name in self.cls2label]
+            self.cate_list     = self.CATEGORIES
+            self.cat_split     = (14, 63)
 
-        self.width = self.vid_info["width"]
-        self.height = self.vid_info["height"]
-        long_side = min(self.width, self.height)
-        self.font_size = max(int(round((long_side / 40))), 1)
-        self.box_width = max(int(round(long_side / 180)), 1)
-        self.font = ImageFont.truetype("./Roboto-Bold.ttf", self.font_size)
+        self.cls2id    = {name: i for i, name in enumerate(self.cate_list)}
+        excl           = exclude_class if exclude_class is not None else self.EXCLUSION
+        self.excl_ids  = {self.cls2id[c] for c in excl if c in self.cls2id}
 
-        self.box_color = (191, 40, 41)
-        self.category_colors = ((176, 85, 234), (87, 118, 198), (52, 189, 199))
-        self.category_trans = int(0.6 * 255)
+        # Drawing params
+        W, H             = self.info["width"], self.info["height"]
+        long_side        = min(W, H)
+        self.width       = W
+        self.height      = H
+        self.font_size   = max(int(round(long_side / 40)), 1)
+        self.box_width   = max(int(round(long_side / 180)), 1)
+        self.font        = ImageFont.truetype("./Roboto-Bold.ttf", self.font_size)
+        self.box_color   = (191, 40, 41)
+        self.label_alpha = int(0.6 * 255)
 
-        self.action_dictionary = dict()
+        # Action state (shared between load/write threads)
+        self._action_dict: Dict[int, Dict] = {}
 
+        # ── Realtime output ──────────────────────────────────────────────
         if realtime:
-            # Output Video
-            width = self.vid_info["width"]
-            height = self.vid_info["height"]
-            fps = self.vid_info["fps"]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self.out_vid = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            fourcc       = cv2.VideoWriter_fourcc(*"mp4v")
+            self._outvid = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
         else:
-            self.frame_queue = mp.JoinableQueue(512)
-            self.result_queue = mp.JoinableQueue()
-            self.track_queue = mp.JoinableQueue()
-            self.done_queue = mp.Queue()
-            self.frame_loader = mp.Process(target=self._load_frame, args=(video_path,))
-            self.frame_loader.start()
-            self.video_writer = mp.Process(target=self._wirte_frame, args=(output_path,))
-            self.video_writer.start()
+            # ── Offline: three queues, two background threads ─────────────
+            self._frame_q  = queue.Queue(maxsize=512)   # raw frames
+            self._result_q = queue.Queue()              # predictions
+            self._track_q  = queue.Queue()              # tracking boxes
+            self._done_q   = queue.Queue()              # written frame signals
 
-    def realtime_write_frame(self, result, orig_img, boxes, scores, ids):
-        orig_img = orig_img[:, :, ::-1]
+            self._loader = threading.Thread(
+                target=self._load_frames, args=(input_path,),
+                daemon=True, name="FrameLoader",
+            )
+            self._writer = threading.Thread(
+                target=self._write_frames, args=(output_path,),
+                daemon=True, name="FrameWriter",
+            )
+            self._loader.start()
+            self._writer.start()
+
+    # ── Realtime API ──────────────────────────────────────────────────────
+
+    def write_realtime_frame(
+        self,
+        result,
+        orig_img: np.ndarray,
+        boxes,
+        scores,
+        ids,
+    ) -> bool:
+        """Composite and display one frame. Returns False when ESC pressed."""
+        orig_img = orig_img[:, :, ::-1]   # RGB → BGR for cv2
 
         if result is not None:
-            result, timestamp, result_ids = result
-            update_boxes = result.bbox
-            update_scores = result.get_field("scores")
-            update_ids = result_ids
-            if update_boxes is not None:
-                self.update_action_dictionary(update_scores, update_ids)
+            pred, _ts, pred_ids = result
+            self._update_action_dict(pred.get_field("scores"), pred_ids)
 
         if boxes is not None:
-            last_visual_mask = self.visual_result(boxes, ids)
-            orig_img = self.visual_frame(orig_img, last_visual_mask)
+            mask     = self._render_labels(boxes, ids)
+            orig_img = self._blend(orig_img, mask)
 
-        cv2.imshow("my webcam", orig_img)
-        self.out_vid.write(orig_img)
+        cv2.imshow("AlphAction", orig_img)
+        self._outvid.write(orig_img)
+        return cv2.waitKey(1) != 27
 
-        if cv2.waitKey(1) == 27:
-            return False
-        return True
+    # ── Offline queue API (called from main thread) ───────────────────────
 
-    def _load_frame(self, video_path):
-        vid = cv2.VideoCapture(video_path)
-        vid.set(cv2.CAP_PROP_POS_MSEC, self.start)
-        vid_avail = True
+    def send_result(self, result) -> None:
+        self._result_q.put(result)
+
+    def send_track(self, result) -> None:
+        self._track_q.put(result)
+
+    def show_progress(self, total_frames: int) -> None:
+        cnt  = 0
         while True:
-            vid_avail, frame = vid.read()
-            if not vid_avail:
+            try:
+                self._done_q.get_nowait()
+                cnt += 1
+            except queue.Empty:
                 break
-            mills = vid.get(cv2.CAP_PROP_POS_MSEC)
-            if self.duration != -1 and mills > self.start + self.duration:
-                break
-            self.frame_queue.put((frame, mills))
-
-        vid.release()
-        self.frame_queue.put("DONE")
-        self.frame_queue.join()
-        self.frame_queue.close()
-        # tqdm.write("load frame closed")
-
-    def _wirte_frame(self, output_path):
-        width = self.vid_info["width"]
-        height = self.vid_info["height"]
-        fps = self.vid_info["fps"]
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out_vid = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-        has_frame = True
-
-        result = self.result_queue.get()
-        timestamp = float('inf')
-        result_ids = None
-        if not isinstance(result, str):
-            result, timestamp, result_ids = result
-        while has_frame:
-            track_result = self.track_queue.get()
-
-            # read frame
-            data = self.frame_queue.get()
-            self.frame_queue.task_done()
-
-            if isinstance(result, str) and data == "DONE":
-                self.track_queue.task_done()
-                self.result_queue.task_done()
-                break
-
-            # note that the timestamp should be in milliseconds
-            frame, mills = data
-
-            if self.show_time:
-                frame = self.visual_timestampe(frame, mills)
-            if mills - timestamp + 0.5 > 0:
-                # print("renew action_dict:{}".format(self.action_dictionary))
-                boxes = result.bbox
-                scores = result.get_field("scores")
-                ids = result_ids
-
-                self.result_queue.task_done()
-                result = self.result_queue.get()
-                if not isinstance(result, str):
-                    result, timestamp, result_ids = result
-                else:
-                    timestamp = float('inf')
-            else:
-                boxes, ids = track_result
-                scores = None
-
-            if boxes is not None:
-                self.update_action_dictionary(scores, ids)
-                last_visual_mask = self.visual_result(boxes, ids)
-                new_frame = self.visual_frame(frame, last_visual_mask)
-                out_vid.write(new_frame)
-            else:
-                out_vid.write(frame)
-
-            self.track_queue.task_done()
-            self.done_queue.put(True)
-
-        out_vid.release()
-        tqdm.write("The output video has been written to the disk.")
-
-    def hou_min_sec(self, total_millis):
-        total_millis = int(total_millis)
-        millis = total_millis % 1000
-        total_millis /= 1000
-        seconds = total_millis % 60
-        total_millis /= 60
-        minutes = total_millis % 60
-        total_millis /= 60
-        hours = total_millis
-        return ("%02d:%02d:%02d.%03d" % (hours, minutes, seconds, millis))
-
-    def visual_timestampe(self, frame, mills):
-        time_text = self.hou_min_sec(mills)
-        img = Image.fromarray(frame[..., ::-1])
-        img = img.convert("RGBA")
-
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        trans_draw = ImageDraw.Draw(overlay)
-        text_width, text_height = trans_draw.textsize(time_text, font=self.font)
-        width_pad = max(self.font_size // 2, 1)
-        rec_height = int(round(1.8 * text_height))
-        height_pad = round((rec_height - text_height) / 2)
-
-        r_x1 = 0
-        r_y2 = img.height
-        r_x2 = r_x1 + text_width + width_pad * 2
-        r_y1 = r_y2 - rec_height
-        rec_pos = (r_x1, r_y1, r_x2, r_y2)
-        text_pos = (r_x1 + width_pad, r_y1 + height_pad)
-
-        trans_draw.rectangle(rec_pos, fill=(0, 0, 0, self.category_trans))
-        trans_draw.text(text_pos, time_text, fill=(255, 255, 255, self.category_trans), font=self.font, align="center")
-
-        img = Image.alpha_composite(img, overlay)
-
-        img = img.convert("RGB")
-
-        return np.array(img)[..., ::-1]
-
-    def update_action_dictionary(self, scores, ids):
-        # Update action_dictionary
-        if scores is not None:
-            for score, id in zip(scores, ids):
-                show_idx = torch.nonzero(score >= self.confidence_threshold, as_tuple=False).squeeze(1)
-                captions = []
-                bg_colors = []
-
-                #captions.append("id: {}".format(int(id)))
-                #bg_colors.append(0)
-
-                for category_id in show_idx:
-                    if category_id in self.exclude_id:
-                        continue
-                    label = self.cate_to_show[category_id]
-                    conf = " %.2f" % score[category_id]
-                    caption = label + conf
-                    captions.append(caption)
-                    if category_id < self.category_split[0]:
-                        bg_colors.append(0)
-                    elif category_id < self.category_split[1]:
-                        bg_colors.append(1)
-                    else:
-                        bg_colors.append(2)
-
-                self.action_dictionary[int(id)] = {
-                    "captions": captions,
-                    "bg_colors": bg_colors,
-                }
-
-    def visual_result(self, boxes, ids):
-        bboxes = boxes
-        ids = ids
-
-        result_vis = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(result_vis)
-
-        for box in bboxes:
-            draw.rectangle(box.tolist(), outline=self.box_color + (255,), width=self.box_width)
-
-        for box, id in zip(bboxes, ids):
-            caption_and_color = self.action_dictionary.get(int(id), None)
-
-            if caption_and_color is None:
-                captions = []
-                bg_colors = []
-            else:
-                captions = caption_and_color['captions']
-                bg_colors = caption_and_color['bg_colors']
-
-            if len(captions) == 0:
-                continue
-            x1, y1, x2, y2 = box.tolist()
-            overlay = Image.new("RGBA", result_vis.size, (0, 0, 0, 0))
-            trans_draw = ImageDraw.Draw(overlay)
-            caption_sizes = [trans_draw.textsize(caption, font=self.font) for caption in captions]
-            caption_widths, caption_heights = list(zip(*caption_sizes))
-            max_height = max(caption_heights)
-            rec_height = int(round(1.8 * max_height))
-            space_height = int(round(0.2 * max_height))
-            total_height = (rec_height + space_height) * (len(captions) - 1) + rec_height
-            width_pad = max(self.font_size // 2, 1)
-            start_y = max(round(y1) - total_height, space_height)
-
-            for i, caption in enumerate(captions):
-                r_x1 = round(x1)
-                r_y1 = start_y + (rec_height + space_height) * i
-                r_x2 = r_x1 + caption_widths[i] + width_pad * 2
-                r_y2 = r_y1 + rec_height
-                rec_pos = (r_x1, r_y1, r_x2, r_y2)
-
-                height_pad = round((rec_height - caption_heights[i]) / 2)
-                text_pos = (r_x1 + width_pad, r_y1 + height_pad)
-
-                trans_draw.rectangle(rec_pos, fill=self.category_colors[bg_colors[i]] + (self.category_trans,))
-                trans_draw.text(text_pos, caption, fill=(255, 255, 255, self.category_trans), font=self.font,
-                                align="center")
-
-            result_vis = Image.alpha_composite(result_vis, overlay)
-
-        return result_vis
-
-    def visual_frame(self, frame, visual_mask):
-        img = Image.fromarray(frame[..., ::-1])
-        img = img.convert("RGBA")
-        img = Image.alpha_composite(img, visual_mask)
-
-        img = img.convert("RGB")
-
-        return np.array(img)[..., ::-1]
-
-    def visual_frame_old(self, frame, result):
-        bboxes = result.bbox
-        scores = result.get_field("scores")
-        img = Image.fromarray(frame[..., ::-1])
-        img = img.convert("RGBA")
-
-        draw = ImageDraw.Draw(img)
-        for box in bboxes:
-            draw.rectangle(box.tolist(), outline=self.box_color + (255,), width=self.box_width)
-
-        for box, score in zip(bboxes, scores):
-            show_idx = torch.nonzero(score >= self.confidence_threshold, as_tuple=False).squeeze(1)
-            captions = []
-            bg_colors = []
-            for category_id in show_idx:
-                if category_id in self.exclude_id:
-                    continue
-                label = self.cate_to_show[category_id]
-                conf = " %.2f" % score[category_id]
-                caption = label + conf
-                captions.append(caption)
-                if category_id <= self.category_split[0]:
-                    bg_colors.append(0)
-                elif category_id <= self.category_split[1]:
-                    bg_colors.append(1)
-                else:
-                    bg_colors.append(2)
-
-            x1, y1, x2, y2 = box.tolist()
-            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-            trans_draw = ImageDraw.Draw(overlay)
-            caption_sizes = [trans_draw.textsize(caption, font=self.font) for caption in captions]
-            caption_widths, caption_heights = list(zip(*caption_sizes))
-            max_height = max(caption_heights)
-            rec_height = int(round(1.8 * max_height))
-            space_height = int(round(0.2 * max_height))
-            total_height = (rec_height + space_height) * (len(captions) - 1) + rec_height
-            width_pad = max(self.font_size // 2, 1)
-            start_y = max(round(y1) - total_height, space_height)
-
-            for i, caption in enumerate(captions):
-                r_x1 = round(x1)
-                r_y1 = start_y + (rec_height + space_height) * i
-                r_x2 = r_x1 + caption_widths[i] + width_pad * 2
-                r_y2 = r_y1 + rec_height
-                rec_pos = (r_x1, r_y1, r_x2, r_y2)
-
-                height_pad = round((rec_height - caption_heights[i]) / 2)
-                text_pos = (r_x1 + width_pad, r_y1 + height_pad)
-
-                trans_draw.rectangle(rec_pos, fill=self.category_colors[bg_colors[i]] + (self.category_trans,))
-                trans_draw.text(text_pos, caption, fill=(255, 255, 255, self.category_trans), font=self.font,
-                                align="center")
-
-            img = Image.alpha_composite(img, overlay)
-
-        img = img.convert("RGB")
-
-        return np.array(img)[..., ::-1]
-
-    def send(self, result):
-        self.result_queue.put(result)
-
-    def send_track(self, result):
-        self.track_queue.put(result)
-
-    def close(self):
-        if self.realtime:
-            self.out_vid.release()
-        else:
-            self.result_queue.join()
-            self.result_queue.close()
-
-            self.track_queue.join()
-            self.track_queue.close()
-
-    def progress_bar(self, total):
-        # get initial
-        cnt = 0
-        while not self.done_queue.empty():
-            _ = self.done_queue.get()
-            cnt += 1
-        pbar = tqdm(total=total, initial=cnt, desc="Video Writer", unit=" frame")
-        # update bar
-        while cnt < total:
-            _ = self.done_queue.get()
+        pbar = tqdm(total=total_frames, initial=cnt,
+                    desc="Video Writer", unit=" frame")
+        while cnt < total_frames:
+            self._done_q.get()
             cnt += 1
             pbar.update(1)
-        # close bar
         pbar.close()
+
+    def close(self) -> None:
+        if self.realtime:
+            self._outvid.release()
+            cv2.destroyAllWindows()
+        else:
+            self._writer.join()
+
+    # ── Frame loader thread ───────────────────────────────────────────────
+
+    def _load_frames(self, path: str | int) -> None:
+        cap = cv2.VideoCapture(path)
+        cap.set(cv2.CAP_PROP_POS_MSEC, self.start)
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if self.duration != -1 and ms > self.start + self.duration:
+                break
+            self._frame_q.put((frame, ms))
+        cap.release()
+        self._frame_q.put("DONE")
+
+    # ── Frame writer thread ───────────────────────────────────────────────
+
+    def _write_frames(self, output_path: str) -> None:
+        W, H   = self.info["width"], self.info["height"]
+        fps    = self.info["fps"]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out    = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+
+        # Initialise with first prediction result
+        pred_result  = self._result_q.get()
+        pred_ts      = float("inf")
+        pred_ids     = None
+        if not isinstance(pred_result, str):
+            pred_result, pred_ts, pred_ids = pred_result
+
+        while True:
+            track = self._track_q.get()
+            data  = self._frame_q.get()
+
+            if isinstance(pred_result, str) and data == "DONE":
+                break
+
+            frame, ms = data
+
+            if self.show_time:
+                frame = self._draw_timestamp(frame, ms)
+
+            if ms - pred_ts + 0.5 > 0:
+                # New prediction has become current
+                boxes  = pred_result.bbox
+                scores = pred_result.get_field("scores")
+                ids    = pred_ids
+
+                pred_result = self._result_q.get()
+                if not isinstance(pred_result, str):
+                    pred_result, pred_ts, pred_ids = pred_result
+                else:
+                    pred_ts = float("inf")
+            else:
+                boxes, ids = track
+                scores     = None
+
+            if boxes is not None:
+                self._update_action_dict(scores, ids)
+                mask  = self._render_labels(boxes, ids)
+                frame = self._blend(frame, mask)
+
+            out.write(frame)
+            self._done_q.put(True)
+
+        out.release()
+        tqdm.write("Output video written.")
+
+    # ── Drawing helpers ───────────────────────────────────────────────────
+
+    def _update_action_dict(self, scores, ids) -> None:
+        if scores is None:
+            return
+        for score, pid in zip(scores, ids):
+            above = torch.nonzero(
+                score >= self.thresh, as_tuple=False
+            ).squeeze(1).tolist()
+
+            captions, colors = [], []
+            for cid in above:
+                if cid in self.excl_ids:
+                    continue
+                label = self.cate_list[cid]
+                captions.append(f"{label} {score[cid]:.2f}")
+                if cid < self.cat_split[0]:
+                    colors.append(0)
+                elif cid < self.cat_split[1]:
+                    colors.append(1)
+                else:
+                    colors.append(2)
+
+            self._action_dict[int(pid)] = {
+                "captions": captions,
+                "colors":   colors,
+            }
+
+    def _render_labels(self, boxes, ids) -> Image.Image:
+        """Build a transparent RGBA overlay with boxes and labels."""
+        canvas = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        draw   = ImageDraw.Draw(canvas)
+
+        # Draw bounding boxes
+        for box in boxes:
+            draw.rectangle(
+                box.tolist(),
+                outline=self.box_color + (255,),
+                width=self.box_width,
+            )
+
+        # Draw labels above each box
+        for box, pid in zip(boxes, ids):
+            info = self._action_dict.get(int(pid))
+            if not info or not info["captions"]:
+                continue
+
+            x1, y1 = box.tolist()[:2]
+            overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+            td      = ImageDraw.Draw(overlay)
+
+            sizes   = [_text_size(td, c, self.font) for c in info["captions"]]
+            widths, heights = zip(*sizes)
+            max_h   = max(heights)
+            rec_h   = int(round(1.8 * max_h))
+            gap     = int(round(0.2 * max_h))
+            pad     = max(self.font_size // 2, 1)
+            total_h = (rec_h + gap) * (len(info["captions"]) - 1) + rec_h
+            start_y = max(round(y1) - total_h, gap)
+
+            for i, caption in enumerate(info["captions"]):
+                rx1  = round(x1)
+                ry1  = start_y + (rec_h + gap) * i
+                color = self.COLORS[info["colors"][i]] + (self.label_alpha,)
+                td.rectangle(
+                    (rx1, ry1, rx1 + widths[i] + pad * 2, ry1 + rec_h),
+                    fill=color,
+                )
+                td.text(
+                    (rx1 + pad, ry1 + round((rec_h - heights[i]) / 2)),
+                    caption,
+                    fill=(255, 255, 255, self.label_alpha),
+                    font=self.font,
+                    align="center",
+                )
+            canvas = Image.alpha_composite(canvas, overlay)
+
+        return canvas
+
+    def _draw_timestamp(self, frame: np.ndarray, ms: float) -> np.ndarray:
+        img    = Image.fromarray(frame[..., ::-1]).convert("RGBA")
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw   = ImageDraw.Draw(overlay)
+
+        text   = _ms_to_timestamp(ms)
+        tw, th = _text_size(draw, text, self.font)
+        pad    = max(self.font_size // 2, 1)
+        rec_h  = int(round(1.8 * th))
+        y0     = img.height - rec_h
+
+        draw.rectangle((0, y0, tw + pad * 2, img.height),
+                        fill=(0, 0, 0, self.label_alpha))
+        draw.text((pad, y0 + round((rec_h - th) / 2)), text,
+                  fill=(255, 255, 255, self.label_alpha),
+                  font=self.font, align="center")
+
+        merged = Image.alpha_composite(img, overlay).convert("RGB")
+        return np.array(merged)[..., ::-1]
+
+    def _blend(self, frame: np.ndarray, mask: Image.Image) -> np.ndarray:
+        """Alpha-composite *mask* onto *frame* (BGR numpy array)."""
+        img    = Image.fromarray(frame[..., ::-1]).convert("RGBA")
+        merged = Image.alpha_composite(img, mask).convert("RGB")
+        return np.array(merged)[..., ::-1]

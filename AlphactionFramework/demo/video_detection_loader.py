@@ -1,274 +1,285 @@
+"""
+VideoDetectionLoader — modernised, threading-based.
+
+Reads frames from a video file or webcam, runs person detection/tracking,
+and feeds results into two queues consumed by downstream workers.
+
+Compatible with Python 3.9+, PyTorch 2.x.
+No multiprocessing — uses threading throughout to avoid POSIX semaphore
+issues in Docker / Colab environments.
+"""
+
+from __future__ import annotations
+
+import queue
+import threading
 from itertools import count
-from threading import Thread
-from queue import Queue
+from time import sleep
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from time import sleep
-from tqdm import tqdm
-import queue
-
 import torch
-import torch.multiprocessing as mp
 from torchvision.transforms import functional as F
+from tqdm import tqdm
 
 from detector.apis import get_detector
 
 
-class Resize(object):
-    def __init__(self, min_size, max_size):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class SharedValue:
+    """Thread-safe integer value — replaces mp.Value('i', ...)."""
+
+    def __init__(self, initial: int = 0) -> None:
+        self._value = initial
+        self._lock  = threading.Lock()
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+    @value.setter
+    def value(self, v: int) -> None:
+        with self._lock:
+            self._value = v
+
+
+class Resize:
+    """Aspect-ratio-preserving resize with an optional max-size cap."""
+
+    def __init__(self, min_size: int, max_size: Optional[int]) -> None:
         self.min_size = min_size
         self.max_size = max_size
 
-    # modified from torchvision to add support for max size
-    def get_size(self, image_size):
-        w, h = image_size
-        size = self.min_size
+    def _target_size(self, w: int, h: int) -> Tuple[int, int]:
+        size     = self.min_size
         max_size = self.max_size
         if max_size is not None:
-            min_original_size = float(min((w, h)))
-            max_original_size = float(max((w, h)))
-            if max_original_size / min_original_size * size > max_size:
-                size = int(round(max_size * min_original_size / max_original_size))
-
+            lo, hi = float(min(w, h)), float(max(w, h))
+            if hi / lo * size > max_size:
+                size = int(round(max_size * lo / hi))
         if (w <= h and w == size) or (h <= w and h == size):
-            return (h, w)
-
+            return h, w
         if w < h:
-            ow = size
-            oh = int(size * h / w)
-        else:
-            oh = size
-            ow = int(size * w / h)
+            return int(size * h / w), size
+        return size, int(size * w / h)
 
-        return (oh, ow)
-
-    def __call__(self, image):
-        size = self.get_size(image.size)
-        image = F.resize(image, size)
-        return image
+    def __call__(self, image):          # PIL image
+        h, w  = self._target_size(*image.size)
+        return F.resize(image, (h, w))
 
 
-class VideoDetectionLoader(object):
-    '''
-    This Class takes the video from the source (video file or camera) and tracks the person.
-    '''
+# ---------------------------------------------------------------------------
+# Main loader
+# ---------------------------------------------------------------------------
 
-    def __init__(self, cfg, track_queue, action_queue, predictor_process):
-        self.cfg = cfg
-        self.detector = None
+class VideoDetectionLoader:
+    """
+    Streams frames from *input_path*, runs a person detector on each frame,
+    and pushes results onto two queues:
+
+    * ``track_queue``  — (orig_img, boxes, scores, ids) for the main thread
+    * ``action_queue`` — (frame_data, video_size) for the predictor worker
+    """
+
+    def __init__(
+        self,
+        cfg,
+        track_queue:  queue.Queue,
+        action_queue: queue.Queue,
+        predictor_process: SharedValue,
+    ) -> None:
+        self.cfg        = cfg
         self.input_path = cfg.input_path
+        self.start_ms   = cfg.start
+        self.dur_ms     = cfg.duration
+        self.realtime   = cfg.realtime
+        self.detector   = None          # lazy — created inside worker thread
 
-        self.start_mill = cfg.start
-        self.duration_mill = cfg.duration
-        self.realtime = cfg.realtime
+        # Read video metadata once
+        cap = cv2.VideoCapture(self.input_path)
+        assert cap.isOpened(), f"Cannot open video source: {self.input_path}"
+        self.videoinfo = {
+            "fourcc":    int(cap.get(cv2.CAP_PROP_FOURCC)),
+            "fps":       cap.get(cv2.CAP_PROP_FPS),
+            "frameSize": (
+                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            ),
+        }
+        cap.release()
 
-        stream = cv2.VideoCapture(self.input_path)
-        assert stream.isOpened(), 'Cannot capture source'
-        self.fourcc = int(stream.get(cv2.CAP_PROP_FOURCC))
-        self.fps = stream.get(cv2.CAP_PROP_FPS)
-        self.frameSize = (int(stream.get(cv2.CAP_PROP_FRAME_WIDTH)), int(stream.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        self.videoinfo = {'fourcc': self.fourcc, 'fps': self.fps, 'frameSize': self.frameSize}
-        stream.release()
-
-        self._stopped = mp.Value('b', False)
+        self._stop       = threading.Event()
         self.track_queue = track_queue
-        self.action_queue = action_queue
-        self.predictor_process = predictor_process
+        self.action_queue= action_queue
+        self.predictor   = predictor_process
 
-    def start_worker(self, target):
-        p = mp.Process(target=target, args=())
-        p.start()
-        return p
+    # ── Lifecycle ────────────────────────────────────────────────────────
 
-    def start(self):
-        # start a thread to pre process images for object detection
-        self.image_preprocess_worker = self.start_worker(self.frame_preprocess)
+    def start(self) -> "VideoDetectionLoader":
+        self._worker = threading.Thread(
+            target=self._run, daemon=True, name="VDL-worker"
+        )
+        self._worker.start()
         return self
 
-    def stop(self):
-        # end threads
-        self.image_preprocess_worker.join()
-        # clear queues
-        self.clear_queues()
+    def terminate(self) -> None:
+        self._stop.set()
+        self._worker.join(timeout=10)
+        _drain(self.track_queue)
+        _drain(self.action_queue)
 
-    def terminate(self):
-        self._stopped.value = True
-        self.stop()
-
-    def clear_queues(self):
-        self.clear(self.track_queue)
-        self.clear(self.action_queue)
-
-    def clear(self, queue):
-        while not queue.empty():
-            queue.get()
-
-    def wait_and_put(self, queue, item):
-        if not self.stopped:
-            queue.put(item)
-
-    def wait_and_get(self, queue):
-        if not self.stopped:
-            return queue.get()
-
-    def wait_till_empty(self, queue):
-        if not queue.empty():
-            number_of_items = queue.qsize()
-            print("{} item(s) to be processed".format(number_of_items))
-            rest = number_of_items
-            for i in tqdm(range(number_of_items)):
-                if rest + i < number_of_items:
-                    continue
-                else:
-                    rest = queue.qsize()
-                    sleep(0.1)
-
-            while True:
-                if queue.empty():
-                    print("Process completed")
-                    return
-                else:
-                    sleep(0.1)
-
-    def frame_preprocess(self):
-        # --- ANTI-DEADLOCK PATCH ---
-        import cv2
-        cv2.setNumThreads(0)
-        torch.set_num_threads(1)
-        torch.backends.cudnn.benchmark = False
-        # ---------------------------
-
-        if self.detector is None:
-            self.detector = get_detector(self.cfg)
-
-        stream = cv2.VideoCapture(self.input_path)
-        assert stream.isOpened(), 'Cannot capture source'
-
-        if not self.realtime:
-            stream.set(cv2.CAP_PROP_POS_MSEC, self.start_mill)
-
-        cur_millis = 0
-
-        # keep looping infinitely
-        for i in count():
-            if self.stopped or (self.realtime and self.predictor_process.value == -1):
-                stream.release()
-                print("Video detection loader stopped")
-                return
-            if not self.track_queue.full():
-                # otherwise, ensure the queue has room in it
-                # The frame is in BGR format
-                (grabbed, frame) = stream.read()
-                last_millis = cur_millis
-                cur_millis = stream.get(cv2.CAP_PROP_POS_MSEC)
-
-                if not self.realtime and self.duration_mill != -1 and cur_millis > self.start_mill + self.duration_mill:
-                    grabbed = False
-
-                # if the `grabbed` boolean is `False`, then we have
-                # reached the end of the video file
-                if not grabbed:
-                    self.wait_and_put(self.track_queue, (None, None, None, None))
-                    self.wait_and_put(self.action_queue, ("Done", self.videoinfo["frameSize"]))
-
-                    # This process needs to be finished after the predictor process
-                    # Otherwise, it will cause FileNotFoundError, if predictor is
-                    # overwhelmed
-                    predictor_process = self.predictor_process.value
-                    if predictor_process != -1:
-                        tqdm.write(
-                            "Tracking finished. Showing feature extraction progress bar [ ready length / total length ](in msec).")
-                        initial = predictor_process - self.start_mill
-                        pbar = tqdm(total=int(last_millis) - self.start_mill, initial=initial,
-                                    desc="Feature Extraction")
-                        last_pos = initial
-                        while predictor_process != -1:
-                            pbar.update(predictor_process - last_pos)
-                            if self.stopped:
-                                break
-                            last_pos = predictor_process
-                            # try not to read shared value too frequent
-                            sleep(0.1)
-                            predictor_process = self.predictor_process.value
-                        pbar.update(int(last_millis) - last_pos)
-                        pbar.close()
-
-                    stream.release()
-                    return
-
-                # expected frame shape like (1,3,h,w) or (3,h,w)
-                img_k = self.detector.image_preprocess(frame)
-
-                if isinstance(img_k, np.ndarray):
-                    img_k = torch.from_numpy(img_k)
-                # add one dimension at the front for batch if image shape (3,h,w)
-                if img_k.dim() == 3:
-                    img_k = img_k.unsqueeze(0)
-
-                im_dim_list_k = frame.shape[1], frame.shape[0]
-
-                orig_img = frame[:, :, ::-1]
-                im_name = str(i) + '.jpg'
-
-                with torch.no_grad():
-                    # Record original image resolution
-                    im_dim_list_k = torch.FloatTensor(im_dim_list_k).repeat(1, 2)
-                img_det = self.image_detection((img_k, orig_img, im_name, im_dim_list_k))
-                self.image_postprocess(img_det, (frame, cur_millis))
-
-    def image_detection(self, inputs):
-        img, orig_img, im_name, im_dim_list = inputs
-        if img is None or self.stopped:
-            return (None, None, None, None)
-
-        with torch.no_grad():
-            dets = self.detector.images_detection(img, im_dim_list)
-            if isinstance(dets, int) or dets.shape[0] == 0:
-                return (orig_img, None, None, None)
-            if isinstance(dets, np.ndarray):
-                dets = torch.from_numpy(dets)
-            dets = dets.cpu()
-            boxes = dets[:, 1:5]
-            scores = dets[:, 5:6]
-            ids = dets[:, 6:7]
-
-        boxes_k = boxes[dets[:, 0] == 0]
-        if isinstance(boxes_k, int) or boxes_k.shape[0] == 0:
-            return (orig_img, None, None, None)
-
-        return (orig_img, boxes_k, scores[dets[:, 0] == 0], ids[dets[:, 0] == 0])
-
-    def image_postprocess(self, inputs, extra):
-        with torch.no_grad():
-            (orig_img, boxes, scores, ids) = inputs
-            if orig_img is None or self.stopped:
-                self.wait_and_put(self.track_queue, (None, None, None, None))
-                return
-
-            # all parameters to be used in ava
-            frame, cur_millis = extra
-            input = (frame, cur_millis, boxes, scores, ids)
-
-            # Passing these information to AVAPredictorWorker
-            self.wait_and_put(self.action_queue, (input, self.videoinfo["frameSize"]))
-
-            # Only return the tracking results to main thread
-            self.wait_and_put(self.track_queue, (orig_img, boxes, scores, ids))
+    # ── Public read helpers ───────────────────────────────────────────────
 
     def read_track(self):
-        return self.wait_and_get(self.track_queue)
+        return self.track_queue.get()
 
-    def read_action(self):
-        return self.wait_and_get(self.action_queue)
+    # ── Internal ─────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        """Main loop: read frames → detect → push to queues."""
+        cv2.setNumThreads(0)
+        torch.set_num_threads(1)
+
+        self.detector = get_detector(self.cfg)
+
+        cap = cv2.VideoCapture(self.input_path)
+        assert cap.isOpened(), f"Cannot open video source: {self.input_path}"
+        if not self.realtime:
+            cap.set(cv2.CAP_PROP_POS_MSEC, self.start_ms)
+
+        prev_ms = 0.0
+
+        for frame_i in count():
+            if self._stop.is_set():
+                break
+            if self.realtime and self.predictor.value == -1:
+                break
+            if self.track_queue.full():
+                sleep(0.001)
+                continue
+
+            ok, frame = cap.read()
+            prev_ms   = cur_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+
+            if not ok or (
+                not self.realtime
+                and self.dur_ms != -1
+                and cur_ms > self.start_ms + self.dur_ms
+            ):
+                # Signal end of stream
+                self._put(self.track_queue,  (None, None, None, None))
+                self._put(self.action_queue, ("Done", self.videoinfo["frameSize"]))
+                self._await_predictor(prev_ms)
+                break
+
+            # Preprocess & detect
+            img_t = self.detector.image_preprocess(frame)
+            if isinstance(img_t, np.ndarray):
+                img_t = torch.from_numpy(img_t)
+            if img_t.dim() == 3:
+                img_t = img_t.unsqueeze(0)
+
+            orig_img   = frame[:, :, ::-1]                          # BGR→RGB view
+            im_dim     = torch.FloatTensor(
+                (frame.shape[1], frame.shape[0])
+            ).repeat(1, 2)
+
+            with torch.no_grad():
+                det_result = self._detect(img_t, orig_img, im_dim)
+
+            self._postprocess(det_result, frame, cur_ms, frame_i)
+
+        cap.release()
+
+    def _detect(
+        self,
+        img:      torch.Tensor,
+        orig_img: np.ndarray,
+        im_dim:   torch.Tensor,
+    ):
+        with torch.no_grad():
+            dets = self.detector.images_detection(img, im_dim)
+
+        if isinstance(dets, int) or dets.shape[0] == 0:
+            return orig_img, None, None, None
+
+        if isinstance(dets, np.ndarray):
+            dets = torch.from_numpy(dets)
+        dets = dets.cpu()
+
+        mask   = dets[:, 0] == 0
+        boxes  = dets[mask, 1:5]
+        scores = dets[mask, 5:6]
+        ids    = dets[mask, 6:7]
+
+        if boxes.shape[0] == 0:
+            return orig_img, None, None, None
+
+        return orig_img, boxes, scores, ids
+
+    def _postprocess(
+        self,
+        detection,
+        raw_frame: np.ndarray,
+        cur_ms:    float,
+        frame_i:   int,
+    ) -> None:
+        orig_img, boxes, scores, ids = detection
+
+        if orig_img is None or self._stop.is_set():
+            self._put(self.track_queue, (None, None, None, None))
+            return
+
+        self._put(
+            self.action_queue,
+            ((raw_frame, cur_ms, boxes, scores, ids), self.videoinfo["frameSize"]),
+        )
+        self._put(self.track_queue, (orig_img, boxes, scores, ids))
+
+    def _put(self, q: queue.Queue, item) -> None:
+        if not self._stop.is_set():
+            q.put(item)
+
+    def _await_predictor(self, last_ms: float) -> None:
+        """Show a progress bar while the predictor worker catches up."""
+        pred_val = self.predictor.value
+        if pred_val == -1:
+            return
+
+        tqdm.write("Tracking done. Waiting for feature extraction…")
+        initial  = max(pred_val - self.start_ms, 0)
+        total    = max(int(last_ms) - self.start_ms, 1)
+        pbar     = tqdm(total=total, initial=initial, desc="Feature Extraction")
+        last_pos = initial
+
+        while self.predictor.value != -1:
+            cur = self.predictor.value
+            pbar.update(cur - last_pos)
+            last_pos = cur
+            if self._stop.is_set():
+                break
+            sleep(0.1)
+
+        pbar.update(total - last_pos)
+        pbar.close()
 
     @property
-    def stopped(self):
-        return self._stopped.value
+    def stopped(self) -> bool:
+        return self._stop.is_set()
 
-    @property
-    def joint_pairs(self):
-        """Joint pairs which defines the pairs of joint to be swapped
-        when the image is flipped horizontally."""
-        return [[1, 2], [3, 4], [5, 6], [7, 8],
-                [9, 10], [11, 12], [13, 14], [15, 16]]
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def _drain(q: queue.Queue) -> None:
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
