@@ -49,5 +49,3 @@ python3 demo.py \
     --weight-path ../data/models/aia_models/resnet101_8x8f_denseserial.pth
 
 ```
-
-![Output Example](AlphactionFramework/demo/demo_output.png)
