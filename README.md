@@ -1,7 +1,7 @@
 # Long-Term Multi-Person Action Recognition & Tracking (MOT Project)
+![output_video-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/a6b3d839-01fc-4c4b-aa3c-a4fa02cf0ca2)
 
 This project reproduces and runs the **AlphAction** framework for long-term multi-person action recognition and tracking using GPU acceleration via Docker.
-
 The system performs:
 
 - ✅ Person detection (YOLO-based tracking)
