@@ -13,10 +13,33 @@ from itertools import count
 from time import sleep
 
 import torch
+
+# --- PYTORCH STRICT TYPE MIGRATION PATCH ---
+import torch.nn as nn
+_orig_conv3d = nn.Conv3d.__init__
+def _safe_conv3d(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', **kwargs):
+    def make_safe(x):
+        if isinstance(x, str): return x
+        if isinstance(x, (tuple, list)): return tuple(int(i) for i in x)
+        return int(x)
+    _orig_conv3d(self, in_channels, out_channels, make_safe(kernel_size), make_safe(stride), make_safe(padding), make_safe(dilation), int(groups), bias, padding_mode, **kwargs)
+nn.Conv3d.__init__ = _safe_conv3d
+# -------------------------------------------
+
 from tqdm import tqdm
 
 from visualizer import AVAVisualizer
 from action_predictor import AVAPredictorWorker
+
+# import argparse
+# from itertools import count
+# from time import sleep
+#
+# import torch
+# from tqdm import tqdm
+#
+# from visualizer import AVAVisualizer
+# from action_predictor import AVAPredictorWorker
 
 
 # ---------------------------------------------------------------------------
