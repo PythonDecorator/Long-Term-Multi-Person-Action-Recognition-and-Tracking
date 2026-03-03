@@ -569,10 +569,10 @@ def main():
     parser.add_argument("--output-dir",        default="test_results")
     parser.add_argument("--normalize",         action="store_true",
                         help="Resize + trim all videos before running")
-    parser.add_argument("--target-resolution", default="854x480",
-                        help="WxH when --normalize (default: 854x480)")
-    parser.add_argument("--target-duration",   default=10, type=int,
-                        help="Seconds to trim to when --normalize (default: 10)")
+    parser.add_argument("--target-resolution", default="1920x1080",
+                        help="WxH when --normalize (default: 1920x1080)")
+    parser.add_argument("--target-duration",   default=20, type=int,
+                        help="Seconds to trim to when --normalize (default: 20)")
     parser.add_argument("--cfg-path",    default=DEFAULT_CFG)
     parser.add_argument("--weight-path", default=DEFAULT_WEIGHTS)
     parser.add_argument("--cpu",         action="store_true")

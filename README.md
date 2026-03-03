@@ -22,7 +22,8 @@ This project runs inside Docker with:
 - cuDNN 7
 - Ubuntu 18.04
 
-⚠️ **Important:** This repository depends on legacy PyTorch APIs. Newer versions of PyTorch (≥1.10) will break due to `Conv3D` API changes.
+⚠️ **Important:** This repository depends on legacy PyTorch APIs. 
+Newer versions of PyTorch (≥1.10) will break due to `Conv3D` API changes.
 
 ---
 
@@ -39,12 +40,52 @@ docker compose build --no-cache
 The paths in the command below assume they are located in the parent directory of the project inside the container. 
 Adjust paths as needed based on your setup.
 
-### 2️⃣ Run the Container
+
+### 2️⃣ Notebook Mode (Interactive)
+If you want to run the code interactively in a Jupyter notebook, like Viper, 
+where docker is not used, you can set up a conda environment with the required dependencies:
+link the kernel to your Jupyter setup and install the necessary packages:
+
+```bash
+conda create -n alphaction python=3.7 -y
+conda activate alphaction
+
+# Install ipykernel and link it to your Jupyter setup
+conda install -y ipython ipykernel
+python -m ipykernel install --user --name alphaction --display-name "Python (alphaction)"
+
+pip install torch==1.4.0 torchvision==0.5.0 -f https://download.pytorch.org/whl/cu101/torch_stable.html
+conda install -y -c conda-forge av
+
+pip install --upgrade pip setuptools wheel
+
+pip install \
+    "numpy<1.20" \
+    "cython<3.0" \
+    cython-bbox \
+    scipy==1.4.1 \
+    matplotlib==3.2.2 \
+    easydict \
+    tqdm \
+    opencv-python==4.2.0.34 \
+    tensorboardX==2.0 \
+    yacs==0.1.7
+    
+git clone <reository_link_to>
+
+cd /path/to/Project directory with setup.py
+export TORCH_CUDA_ARCH_LIST="5.2;6.0;6.1;7.0;7.5"
+pip install -e .
+```
+
+### 3️⃣ Run the Demo
+Cd into the project directory and run the demo script with the appropriate paths to your video, 
+config, and model weights:
 
 ```bash
 python3 demo.py \
-    --video-path test_video_3s_480p.mp4 \
-    --output-path output_3s.mp4 \
+    --video-path test_video.mp4 \
+    --output-path output.mp4 \
     --cfg-path ../config_files/resnet101_8x8f_denseserial.yaml \
     --weight-path ../data/models/aia_models/resnet101_8x8f_denseserial.pth
 
