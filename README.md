@@ -71,10 +71,38 @@ pip install \
     tensorboardX==2.0 \
     yacs==0.1.7
     
-git clone <reository_link_to>
+git clone https://github.com/PythonDecorator/Long-Term-Multi-Person-Action-Recognition-and-Tracking.git
 
-cd /path/to/Project directory with setup.py
+cd Long-Term-Multi-Person-Action-Recognition-and-Tracking/AlphactionFramework  # directory with setup.py
 export TORCH_CUDA_ARCH_LIST="5.2;6.0;6.1;7.0;7.5"
+pip install -e .
+```
+
+If there was an error during installation it may be compatibility issues.
+
+### 👉 `Run this:`
+
+```bash
+# Install GCC and G++ 7
+conda install -y -c conda-forge gcc_linux-64=7 gxx_linux-64=7
+
+# Install the CUDA 10.1 development toolkit (which includes the correct nvcc)
+conda install -y -c conda-forge cudatoolkit-dev=10.1
+
+# Force the system to use the Conda GCC/G++ compilers
+export CC=x86_64-conda-linux-gnu-gcc
+export CXX=x86_64-conda-linux-gnu-g++
+
+# Force PyTorch to look for CUDA inside your conda environment
+export CUDA_HOME=$CONDA_PREFIX
+
+module purge
+module load cuda/11.5.0
+module load gcc/8.2.0
+
+cd AlphactionFramework
+rm -rf build
+rm -rf *.egg-info
 pip install -e .
 ```
 
