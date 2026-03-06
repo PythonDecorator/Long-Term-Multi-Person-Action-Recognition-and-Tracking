@@ -67,6 +67,8 @@ module purge
 module load cuda/11.5.0
 module load gcc/8.2.0
 
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
 git clone https://github.com/PythonDecorator/Long-Term-Multi-Person-Action-Recognition-and-Tracking.git
 cd Long-Term-Multi-Person-Action-Recognition-and-Tracking/AlphactionFramework  # directory with setup.py
 
