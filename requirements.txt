@@ -1,0 +1,47 @@
+-e git+https://github.com/PythonDecorator/Long-Term-Multi-Person-Action-Recognition-and-Tracking.git@8729819c09ddb5b31b53301e12c4efc99d1de0ef#egg=alphaction&subdirectory=AlphactionFramework
+av @ file:///home/conda/feedstock_root/build_artifacts/av_1650456888702/work
+certifi @ file:///home/conda/feedstock_root/build_artifacts/certifi_1725278078093/work/certifi
+cycler==0.11.0
+Cython==0.29.37
+cython-bbox==0.1.5
+decorator==4.4.2
+easydict==1.13
+entrypoints @ file:///home/conda/feedstock_root/build_artifacts/entrypoints_1643888246732/work
+fonttools==4.38.0
+importlib-metadata==6.7.0
+ipykernel @ file:///home/conda/feedstock_root/build_artifacts/ipykernel_1620912939357/work/dist/ipykernel-5.5.5-py3-none-any.whl
+ipython==5.8.0
+ipython_genutils @ file:///home/conda/feedstock_root/build_artifacts/ipython_genutils_1716278396992/work
+jupyter_client==7.4.9
+jupyter_core==4.12.0
+kiwisolver==1.4.5
+matplotlib==3.5.3
+nest-asyncio==1.6.0
+numpy @ file:///home/conda/feedstock_root/build_artifacts/numpy_1649806299270/work
+olefile @ file:///home/conda/feedstock_root/build_artifacts/olefile_1701735466804/work
+opencv-python==4.13.0.92
+packaging==24.0
+pexpect @ file:///home/conda/feedstock_root/build_artifacts/pexpect_1706113125309/work
+pickleshare @ file:///home/conda/feedstock_root/build_artifacts/pickleshare_1602536217715/work
+Pillow==9.5.0
+prompt-toolkit==1.0.15
+protobuf==4.24.4
+ptyprocess @ file:///home/conda/feedstock_root/build_artifacts/ptyprocess_1609419310487/work/dist/ptyprocess-0.7.0-py2.py3-none-any.whl
+Pygments @ file:///home/conda/feedstock_root/build_artifacts/pygments_1691408637400/work
+pyparsing==3.1.4
+python-dateutil==2.9.0.post0
+PyYAML==6.0.1
+pyzmq==26.2.1
+scipy==1.4.1
+simplegeneric==0.8.1
+six==1.17.0
+tensorboardX==2.6.2.2
+torch==1.10.0+cu113
+torchvision==0.11.1+cu113
+tornado==6.2
+tqdm==4.67.3
+traitlets @ file:///home/conda/feedstock_root/build_artifacts/traitlets_1598976315411/work
+typing_extensions==4.7.1
+wcwidth==0.1.9
+yacs==0.1.8
+zipp==3.15.0

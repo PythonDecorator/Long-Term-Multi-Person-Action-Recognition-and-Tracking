@@ -47,63 +47,43 @@ where docker is not used, you can set up a conda environment with the required d
 link the kernel to your Jupyter setup and install the necessary packages:
 
 ```bash
-conda create -n alphaction python=3.7 -y
-conda activate alphaction
-
-# Install ipykernel and link it to your Jupyter setup
-conda install -y ipython ipykernel
-python -m ipykernel install --user --name alphaction --display-name "Python (alphaction)"
-
-pip install torch==1.4.0 torchvision==0.5.0 -f https://download.pytorch.org/whl/cu101/torch_stable.html
-conda install -y -c conda-forge av
+conda create -n alphaction_a100 python=3.7 -y
+conda activate alphaction_a100
 
 pip install --upgrade pip setuptools wheel
 
+pip install torch==1.10.0+cu113 torchvision==0.11.1+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html
+pip install "numpy<1.20" "cython<3.0" cython-bbox scipy==1.4.1
+pip install ninja yacs matplotlib tqdm opencv-python
+
 pip install \
-    "numpy<1.20" \
-    "cython<3.0" \
-    cython-bbox \
-    scipy==1.4.1 \
-    matplotlib==3.2.2 \
     easydict \
-    tqdm \
-    opencv-python==4.2.0.34 \
-    tensorboardX==2.0 \
-    yacs==0.1.7
+    tensorboardX \
     
-git clone https://github.com/PythonDecorator/Long-Term-Multi-Person-Action-Recognition-and-Tracking.git
+conda install -c conda-forge av
 
-cd Long-Term-Multi-Person-Action-Recognition-and-Tracking/AlphactionFramework  # directory with setup.py
-export TORCH_CUDA_ARCH_LIST="5.2;6.0;6.1;7.0;7.5"
-pip install -e .
-```
-
-If there was an error during installation it may be compatibility issues.
-
-### 👉 `Run this:`
-
-```bash
-# Install GCC and G++ 7
-conda install -y -c conda-forge gcc_linux-64=7 gxx_linux-64=7
-
-# Install the CUDA 10.1 development toolkit (which includes the correct nvcc)
-conda install -y -c conda-forge cudatoolkit-dev=10.1
-
-# Force the system to use the Conda GCC/G++ compilers
-export CC=x86_64-conda-linux-gnu-gcc
-export CXX=x86_64-conda-linux-gnu-g++
-
-# Force PyTorch to look for CUDA inside your conda environment
-export CUDA_HOME=$CONDA_PREFIX
-
+# unload any existing CUDA or GCC modules to avoid conflicts with the conda environment
 module purge
 module load cuda/11.5.0
 module load gcc/8.2.0
 
-cd AlphactionFramework
-rm -rf build
-rm -rf *.egg-info
-pip install -e .
+git clone https://github.com/PythonDecorator/Long-Term-Multi-Person-Action-Recognition-and-Tracking.git
+cd Long-Term-Multi-Person-Action-Recognition-and-Tracking/AlphactionFramework  # directory with setup.py
+
+FORCE_CUDA=1 pip install -e .
+
+# if any build fails make sure to remove them and before trying 
+# again with the correct CUDA toolkit and GCC versions as shown in the next step
+rm -rf build alphaction_a100.egg-info
+conda install -c conda-forge libiconv -y
+
+# Install ipykernel and link it to your Jupyter setup -  
+# this allows you to select the "Python (alphaction_a100)" kernel in Jupyter notebooks
+conda install -y ipython ipykernel
+python -m ipykernel install --user --name alphaction_a100 --display-name "Python (alphaction_a100)"
+
+# There is a start_project.sh script included in the project that sets up the environment.
+sbatch start_project.sh
 ```
 
 ### 3️⃣ Run the Demo
@@ -111,6 +91,8 @@ Cd into the project directory and run the demo script with the appropriate paths
 config, and model weights:
 
 ```bash
+cd demo
+
 python3 demo.py \
     --video-path test_video.mp4 \
     --output-path output.mp4 \
@@ -118,3 +100,5 @@ python3 demo.py \
     --weight-path ../data/models/aia_models/resnet101_8x8f_denseserial.pth
 
 ```
+
+---
