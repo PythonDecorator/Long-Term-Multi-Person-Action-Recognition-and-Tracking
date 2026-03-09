@@ -1,0 +1,27 @@
+services:
+  alphaction:
+    build: b4
+    image: alphaction:1.4
+    container_name: alphaction_con
+    shm_size: '8gb'
+#    command: >
+#      python3 demo/demo.py
+#      --video-path demo/test_video_3s_480p.mp4
+#      --output-path demo/output_3s.mp4
+#      --cfg-path config_files/resnet50_4x16f_denseserial.yaml
+#      --weight-path data/models/aia_models/resnet50_4x16f_denseserial.pth
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+    volumes:
+      - ./AlphactionFramework:/workspace/AlphAction
+
+    stdin_open: true
+    tty: true
