@@ -2,6 +2,7 @@
 # Copyright (c) Shanghai Jiao Tong University. All rights reserved.
 # Written by Chao Xu (xuchao.19962007@sjtu.edu.cn)
 # -----------------------------------------------------
+# Modified by Amos Okpe — MSc dissertation (University of Hull)
 
 """API of detector"""
 from abc import ABC, abstractmethod
@@ -12,12 +13,17 @@ def get_detector(opt=None):
         from detector.yolo_api import YOLODetector
         from detector.yolo_cfg import cfg
         return YOLODetector(cfg, opt)
+
     elif opt.detector == 'tracker':
         from detector.tracker_api import Tracker
         from detector.tracker_cfg import cfg
         return Tracker(cfg, opt)
+
     else:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"Unknown detector: '{opt.detector}'. "
+            "Choose from: 'yolo', 'tracker'"
+        )
 
 
 class BaseDetector(ABC):

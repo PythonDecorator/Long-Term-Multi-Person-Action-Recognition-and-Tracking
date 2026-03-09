@@ -1,6 +1,6 @@
 services:
   alphaction:
-    build: .
+    build: b4
     image: alphaction:1.4
     container_name: alphaction_con
     shm_size: '8gb'
