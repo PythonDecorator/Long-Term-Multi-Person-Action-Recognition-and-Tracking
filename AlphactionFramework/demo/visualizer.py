@@ -230,11 +230,16 @@ class AVAVisualizer:
 
         # Person re-identifier lives for the duration of this video.
         self._reid = PersonReIdentifier(
-            reid_threshold       = 0.22,   # strict — high-confidence match
-            reid_threshold_relax = 0.38,   # relaxed — re-entry recovery
-            ema_alpha_near       = 0.80,
-            ema_alpha_far        = 0.95,
+            device               = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            reid_threshold       = 0.30,   # strict: same-person deep features ~0.05-0.25
+            reid_threshold_relax = 0.50,   # relaxed: re-entry with lighting change
+            ema_alpha_near       = 0.85,   # high alpha = slow gallery update (stable)
+            ema_alpha_far        = 0.97,   # very conservative for small detections
             max_gallery_size     = 64,
+            lock_release_frames  = 12,     # ~0.5s at 25fps before releasing a lock
+            use_deep_features    = True,
+            use_bg_crop          = True,
+            use_quality_ema      = True,
         )
 
         # ── Realtime or offline output ────────────────────────────────────
