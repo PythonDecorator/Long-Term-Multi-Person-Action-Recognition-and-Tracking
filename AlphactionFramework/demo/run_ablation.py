@@ -41,6 +41,7 @@ import numpy as np
 
 from person_reid import PersonReIdentifier
 from reid_evaluator import (
+    print_before_after_summary,
     EvalResults,
     TrackSegment,
     evaluate_config,
@@ -349,6 +350,7 @@ def main() -> None:
         )
         print(f"done  ({time.time() - t_cfg:.1f}s)  "
               f"F1={result.f1:.4f}  P={result.precision:.4f}  R={result.recall:.4f}")
+        print_before_after_summary(result, cfg["name"])
         all_results.append(result)
 
     elapsed = time.time() - t0

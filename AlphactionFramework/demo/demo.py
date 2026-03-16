@@ -30,6 +30,7 @@ from tqdm import tqdm
 
 from visualizer import AVAVisualizer
 from action_predictor import AVAPredictorWorker
+from demo_figures import DemoFigureSaver
 
 # import argparse
 # from itertools import count
@@ -120,6 +121,15 @@ def main() -> None:
         common_cate         = args.common_cate,
     )
 
+    # ── Figure saver (attaches to video_writer, saves on close) ────────
+    figure_saver = DemoFigureSaver(
+        video_writer  = video_writer,
+        input_path    = args.input_path if not args.webcam else "webcam",
+        output_dir    = "demo_figures",
+        n_reid_frames = 6,
+        thermal_mode  = False,   # set True when running thermal videos
+    )
+
     # ── Predictor worker (threading-based, no spawn) ─────────────────────
     predictor = AVAPredictorWorker(args)
     pred_done = False
@@ -174,6 +184,7 @@ def main() -> None:
         video_writer.show_progress(frame_idx)
 
     video_writer.close()
+    figure_saver.save()
     predictor.terminate()
     print("Done.")
 
