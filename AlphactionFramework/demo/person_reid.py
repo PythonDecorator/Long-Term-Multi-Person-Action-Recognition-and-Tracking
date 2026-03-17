@@ -46,6 +46,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -117,11 +118,22 @@ class _ResNet50Extractor(nn.Module):
     Runs entirely in eval() mode with no_grad.
     """
 
-    def __init__(self, device):
+    def __init__(self, device, weight_path=None):
         super(_ResNet50Extractor, self).__init__()
-        resnet        = models.resnet50(pretrained=True)
+        resnet        = models.resnet50(pretrained=(weight_path is None))
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.device   = device
+        if weight_path and Path(weight_path).exists():
+            state = torch.load(weight_path, map_location="cpu")
+            # Load only backbone keys (ignore head keys if any)
+            bk_state = {k.replace("trainable.", "").replace("frozen.", ""): v
+                        for k, v in state.items()
+                        if "trainable" in k or "frozen" in k}
+            if bk_state:
+                self.backbone.load_state_dict(bk_state, strict=False)
+            else:
+                self.backbone.load_state_dict(state, strict=False)
+            print(f"  [Re-ID] Loaded fine-tuned weights from: {weight_path}")
         self.to(device)
         self.eval()
         self.preprocess = T.Compose([
@@ -203,6 +215,7 @@ class PersonReIdentifier:
         use_deep_features     = True,
         use_bg_crop           = True,
         use_quality_ema       = True,
+        weight_path           = None,  # path to fine-tuned weights (None = ImageNet)
         # legacy compat
         use_strips            = True,
         use_occlusion         = True,
@@ -227,7 +240,7 @@ class PersonReIdentifier:
 
         if use_deep_features:
             print("  [Re-ID] Loading ResNet50 on {} ...".format(device))
-            self._extractor = _ResNet50Extractor(device)
+            self._extractor = _ResNet50Extractor(device, weight_path=weight_path)
             print("  [Re-ID] ResNet50 ready.")
         else:
             self._extractor = None
