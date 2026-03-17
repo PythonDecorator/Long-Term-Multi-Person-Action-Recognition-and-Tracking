@@ -124,30 +124,39 @@ class DemoFigureSaver:
     def __init__(
         self,
         video_writer,
-        input_path:    str,
-        output_dir:    str  = "demo_figures",
-        n_reid_frames: int  = 6,
-        thermal_mode:  bool = False,
-        max_buffer:    int  = 500,
+        input_path:      str,
+        output_dir:      str            = "demo_figures",
+        n_reid_frames:   int            = 6,
+        thermal_mode:    bool           = False,
+        max_buffer:      int            = 500,
+        compare_weights: Optional[str]  = None,
     ):
-        self._vw           = video_writer
-        self._video_name   = Path(input_path).stem
-        self._out_dir      = Path(output_dir)
+        """
+        compare_weights: path to a second set of Re-ID weights to compare against.
+        When set, figures show 3 columns:
+          BEFORE (raw IDs) | main Re-ID system | comparison Re-ID system
+        """
+        self._vw              = video_writer
+        self._video_name      = Path(input_path).stem
+        self._out_dir         = Path(output_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        self._n_frames     = n_reid_frames
-        self._thermal_mode = thermal_mode
-        self._max_buffer   = max_buffer
-        self._thermal      = _ThermalAdapter()
+        self._n_frames        = n_reid_frames
+        self._thermal_mode    = thermal_mode
+        self._max_buffer      = max_buffer
+        self._compare_weights = compare_weights
+        self._thermal         = _ThermalAdapter()
 
         # Frame buffer: list of dicts
-        # { "bgr": np.ndarray, "boxes": list, "pid_map": dict, "idx": int }
+        # { "bgr", "boxes", "tids", "pid_map" (main system), "idx" }
         self._buffer: List[dict] = []
         self._frame_idx = 0
 
         # Patch _run_reid so we intercept every frame that goes through Re-ID
         self._patch_visualizer()
 
-        print(f"  [DemoFigures] Attached — figures will be saved to: {self._out_dir}/")
+        mode = (f"vs {Path(compare_weights).name}" if compare_weights
+                else "standard mode")
+        print(f"  [DemoFigures] Attached ({mode}) → {self._out_dir}/")
 
     # ── Patch the visualizer ──────────────────────────────────────────────────
 
@@ -197,76 +206,154 @@ class DemoFigureSaver:
 
         print(f"  [DemoFigures] Buffered {len(self._buffer)} frames — generating figures ...")
 
+        # Build comparison pid_maps if a second weight set was specified
+        self._compare_pid_maps: Optional[Dict[int, Dict[int,int]]] = None
+        if self._compare_weights:
+            self._compare_pid_maps = self._run_comparison_reid()
+
         self._save_reid_before_after()
         self._save_reid_reentry_strip()
         if self._thermal_mode:
             self._save_thermal_pipeline()
 
+    def _run_comparison_reid(self) -> Dict[int, Dict[int,int]]:
+        """
+        Replay the buffered frames through a second PersonReIdentifier
+        (with compare_weights) and return per-frame pid_maps.
+        Returns { buffer_index: { tid: pid } }
+        """
+        try:
+            from person_reid import PersonReIdentifier
+        except ImportError:
+            print("  [DemoFigures] Cannot import PersonReIdentifier for comparison")
+            return {}
+
+        print(f"  [DemoFigures] Running comparison Re-ID pass "
+              f"({'fine-tuned' if self._compare_weights else 'ImageNet'})...")
+        reid2 = PersonReIdentifier(
+            use_deep_features    = True,
+            use_bg_crop          = True,
+            use_quality_ema      = True,
+            weight_path          = self._compare_weights,
+        )
+        compare_maps: Dict[int, Dict[int,int]] = {}
+        for bi, entry in enumerate(self._buffer):
+            tids  = entry["tids"]
+            boxes = entry["boxes"]
+            bgr   = entry["bgr"]
+            reid2.update(bgr, tids, boxes)
+            compare_maps[bi] = {
+                tid: reid2.get_persistent_id(tid)
+                for tid in tids
+                if reid2.get_persistent_id(tid) is not None
+            }
+        print(f"  [DemoFigures] Comparison pass complete.")
+        return compare_maps
+
     # ── Figure 1: Before / After Re-ID grid ──────────────────────────────────
 
     def _save_reid_before_after(self) -> None:
         out_path = self._out_dir / f"{self._video_name}_reid_before_after.png"
+        buf      = self._buffer
+        compare  = self._compare_pid_maps  # None or {buf_idx: {tid: pid}}
+        has_cmp  = compare is not None
 
-        # Pick n evenly-spaced frames from the buffer, prefer multi-person frames
-        buf = self._buffer
+        # Pick n evenly-spaced frames, prefer multi-person frames
         rich = [b for b in buf if len(b["pid_map"]) >= 2]
         pool = rich if len(rich) >= self._n_frames else buf
         step = max(1, len(pool) // self._n_frames)
-        picks = pool[::step][:self._n_frames]
+        pick_entries = pool[::step][:self._n_frames]
+        # Use object id to map back to buf index — avoids numpy array == crash
+        buf_id_to_idx = {id(e): i for i, e in enumerate(buf)}
+        pick_indices  = [buf_id_to_idx.get(id(e), 0) for e in pick_entries]
 
-        if not picks:
+        if not pick_entries:
             print("  [DemoFigures] Before/after: no suitable frames"); return
 
-        TARGET_W = 680
-        rows = []
-        for entry in picks:
-            bgr  = entry["bgr"]
-            H, W = bgr.shape[:2]
-            sc   = TARGET_W / W
-            sm   = cv2.resize(bgr, (TARGET_W, int(H * sc)))
+        TARGET_W = 580 if has_cmp else 680
+        div_col  = (35, 35, 35)
+        div      = lambda h: np.full((h, 6, 3), div_col, np.uint8)
+        rows     = []
 
-            def sb(box): return tuple(v * sc for v in box)
-
-            # Pair tids with boxes
+        for bi, entry in zip(pick_indices, pick_entries):
+            bgr   = entry["bgr"]
+            H, W  = bgr.shape[:2]
+            sc    = TARGET_W / W
+            sm    = cv2.resize(bgr, (TARGET_W, int(H * sc)))
             paired = list(zip(entry["tids"], entry["boxes"]))
 
-            before = self._draw_frame(sm, paired, entry["pid_map"], sc, "before",
-                                       entry["idx"])
-            after  = self._draw_frame(sm, paired, entry["pid_map"], sc, "after",
-                                       entry["idx"])
-            div    = np.full((before.shape[0], 6, 3), (35, 35, 35), np.uint8)
-            rows.append(np.hstack([before, div, after]))
+            before_panel = self._draw_frame(sm, paired, entry["pid_map"],
+                                             sc, "before", entry["idx"])
+            if has_cmp:
+                # Main system (fine-tuned or ImageNet — whichever is current)
+                main_panel  = self._draw_frame(sm, paired, entry["pid_map"],
+                                               sc, "main", entry["idx"])
+                # Comparison system (the other one)
+                cmp_pid_map = compare.get(bi, {})
+                cmp_panel   = self._draw_frame(sm, paired, cmp_pid_map,
+                                               sc, "compare", entry["idx"])
+                h = max(before_panel.shape[0], main_panel.shape[0], cmp_panel.shape[0])
+                def ph(img):
+                    dh = h - img.shape[0]
+                    return np.vstack([img, np.zeros((dh,img.shape[1],3),np.uint8)]) if dh>0 else img
+                rows.append(np.hstack([ph(before_panel), div(h),
+                                        ph(main_panel),   div(h),
+                                        ph(cmp_panel)]))
+            else:
+                after_panel = self._draw_frame(sm, paired, entry["pid_map"],
+                                               sc, "after", entry["idx"])
+                h = max(before_panel.shape[0], after_panel.shape[0])
+                def ph(img):
+                    dh = h - img.shape[0]
+                    return np.vstack([img, np.zeros((dh,img.shape[1],3),np.uint8)]) if dh>0 else img
+                rows.append(np.hstack([ph(before_panel), div(h), ph(after_panel)]))
 
-        # Pad to same width
-        max_w = max(r.shape[1] for r in rows)
+        if not rows:
+            return
+
+        # Pad rows to same width
+        max_w  = max(r.shape[1] for r in rows)
         padded = []
         for r in rows:
             dw = max_w - r.shape[1]
-            if dw > 0:
-                r = np.hstack([r, np.zeros((r.shape[0], dw, 3), np.uint8)])
-            padded.append(r)
+            padded.append(np.hstack([r, np.zeros((r.shape[0],dw,3),np.uint8)])
+                          if dw > 0 else r)
 
-        # Column header bar
+        # Column header
         W_tot  = padded[0].shape[1]
-        hdr_h  = 50
+        hdr_h  = 52
         header = np.zeros((hdr_h, W_tot, 3), np.uint8)
-        header[:] = (12, 12, 12)
-        hw    = (W_tot - 6) // 2
-        font  = cv2.FONT_HERSHEY_DUPLEX
-        scale = 0.80
-        for txt, x_off, col in [
-            ("BEFORE Re-ID", 0,      (170, 170, 170)),
-            ("AFTER Re-ID",  hw + 6, ( 60, 210,  60)),
-        ]:
-            (tw, th), _ = cv2.getTextSize(txt, font, scale, 1)
+        header[:] = (10, 10, 10)
+        font   = cv2.FONT_HERSHEY_DUPLEX
+        fscale = 0.72
+
+        if has_cmp:
+            # Determine which is which
+            main_is_ft = (self._compare_weights is not None)
+            main_lbl   = "WITH Fine-tuning"  if main_is_ft else "WITHOUT Fine-tuning"
+            cmp_lbl    = "WITHOUT Fine-tuning" if main_is_ft else "WITH Fine-tuning"
+            main_col   = ( 50, 220,  50) if main_is_ft else (200, 200, 100)
+            cmp_col    = (200, 200, 100) if main_is_ft else ( 50, 220,  50)
+            col_w      = (W_tot - 12) // 3
+            headers    = [("BEFORE Re-ID",   0,             (170,170,170)),
+                          (main_lbl,         col_w + 6,     main_col),
+                          (cmp_lbl,          2*col_w + 12,  cmp_col)]
+            # Arrows
+            for x_arr in [col_w+3, 2*col_w+9]:
+                cv2.arrowedLine(header,(x_arr-16,hdr_h//2),(x_arr+16,hdr_h//2),
+                                (100,100,100),2,tipLength=0.4)
+        else:
+            col_w    = (W_tot - 6) // 2
+            headers  = [("BEFORE Re-ID", 0,          (170,170,170)),
+                        ("AFTER Re-ID",  col_w + 6,  ( 60,210, 60))]
+            cv2.arrowedLine(header,(col_w-14,hdr_h//2),(col_w+14,hdr_h//2),
+                            (100,100,100),2,tipLength=0.4)
+
+        for txt, x_off, col in headers:
+            (tw,th),_ = cv2.getTextSize(txt, font, fscale, 1)
             cv2.putText(header, txt,
-                        (x_off + (hw - tw) // 2, (hdr_h + th) // 2),
-                        font, scale, col, 1, cv2.LINE_AA)
-        # Arrow
-        mid_x = hw + 3
-        cv2.arrowedLine(header, (mid_x - 18, hdr_h // 2),
-                        (mid_x + 18, hdr_h // 2),
-                        (120, 120, 120), 2, tipLength=0.5)
+                        (x_off + (col_w - tw)//2, (hdr_h+th)//2),
+                        font, fscale, col, 1, cv2.LINE_AA)
 
         grid = np.vstack([header] + padded)
         cv2.imwrite(str(out_path), grid)
@@ -299,10 +386,16 @@ class DemoFigureSaver:
                 badge_col = (60, 60, 60)
                 label     = f"ID:{tid}"
             else:
-                pid       = pid_map.get(tid, 0)
+                pid = pid_map.get(tid)
+                if pid is None or pid == 0:
+                    continue    # no persistent ID yet — skip this box
                 box_col   = _color(pid)
                 badge_col = box_col
-                label     = f"Person {pid}"
+                # Label differs by mode so reader can tell the columns apart
+                if mode == "compare":
+                    label = f"P{pid} ◀"   # triangle marker distinguishes compare column
+                else:
+                    label = f"Person {pid}"
 
             # Box + corner accents
             cv2.rectangle(vis, (x1, y1), (x2, y2), box_col, thick + 1)
@@ -326,10 +419,22 @@ class DemoFigureSaver:
         # Banner
         bh     = max(28, int(H * 0.052))
         banner = np.zeros((bh, W, 3), np.uint8)
-        banner[:] = (45, 45, 45) if mode == "before" else (18, 55, 18)
-        txt  = ("BEFORE Re-ID  (raw tracker IDs)" if mode == "before"
-                else "AFTER Re-ID  (persistent labels)")
-        tcol = (180, 180, 180) if mode == "before" else (70, 220, 70)
+        if mode == "before":
+            banner[:] = (45, 45, 45)
+            txt  = "BEFORE Re-ID  (raw tracker IDs)"
+            tcol = (180, 180, 180)
+        elif mode == "compare":
+            banner[:] = (55, 40, 10)   # warm amber tint for comparison column
+            txt  = "WITHOUT Fine-tuning  (ImageNet)"
+            tcol = (200, 200, 80)
+        elif mode == "main":
+            banner[:] = (10, 50, 20)
+            txt  = "WITH Fine-tuning  (domain-adapted)"
+            tcol = (60, 220, 60)
+        else:  # "after"
+            banner[:] = (18, 55, 18)
+            txt  = "AFTER Re-ID  (persistent labels)"
+            tcol = (70, 220, 70)
         (tw2, th2), _ = cv2.getTextSize(txt, font, fscl * 0.82, 1)
         cv2.putText(banner, txt, ((W-tw2)//2, (bh+th2)//2),
                     font, fscl * 0.82, tcol, 1, cv2.LINE_AA)

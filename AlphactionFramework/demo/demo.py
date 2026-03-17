@@ -82,6 +82,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Box confidence threshold for tracker (default: 0.1)")
     p.add_argument("--tracker-nms-thres", default=0.4, type=float,
                    help="NMS threshold for tracker (default: 0.4)")
+    p.add_argument("--reid-weights", default=None,
+                   help="Path to fine-tuned Re-ID weights (.pth). "
+                        "Default: ImageNet ResNet50 (no fine-tuning).")
+    p.add_argument("--compare-weights", default=None,
+                   help="Path to a SECOND set of Re-ID weights for side-by-side "
+                        "comparison figure. When set, figures show 3 columns: "
+                        "BEFORE | WITH fine-tuning | WITHOUT fine-tuning.")
+    p.add_argument("--thermal", action="store_true",
+                   help="Input is thermal video — also save thermal pipeline figure.")
+    p.add_argument("--no-figures", action="store_true",
+                   help="Skip figure generation (faster, useful for long videos).")
+    p.add_argument("--figures-dir", default="demo_figures",
+                   help="Directory to save figures (default: demo_figures).")
     return p
 
 
@@ -121,14 +134,32 @@ def main() -> None:
         common_cate         = args.common_cate,
     )
 
+    # ── Re-ID fine-tuned weights (optional) ─────────────────────────────
+    if args.reid_weights:
+        # Rebuild the Re-ID extractor inside video_writer with fine-tuned weights
+        from person_reid import PersonReIdentifier
+        video_writer._reid = PersonReIdentifier(
+            use_deep_features    = True,
+            use_bg_crop          = True,
+            use_quality_ema      = True,
+            weight_path          = args.reid_weights,
+        )
+        print(f"  Re-ID: using fine-tuned weights → {args.reid_weights}")
+    else:
+        print("  Re-ID: using ImageNet ResNet50 (run finetune_reid.py to improve)")
+
     # ── Figure saver (attaches to video_writer, saves on close) ────────
-    figure_saver = DemoFigureSaver(
-        video_writer  = video_writer,
-        input_path    = args.input_path if not args.webcam else "webcam",
-        output_dir    = "demo_figures",
-        n_reid_frames = 6,
-        thermal_mode  = False,   # set True when running thermal videos
-    )
+    if not args.no_figures:
+        figure_saver = DemoFigureSaver(
+            video_writer     = video_writer,
+            input_path       = args.input_path if not args.webcam else "webcam",
+            output_dir       = args.figures_dir,
+            n_reid_frames    = 6,
+            thermal_mode     = args.thermal,
+            compare_weights  = args.compare_weights,
+        )
+    else:
+        figure_saver = None
 
     # ── Predictor worker (threading-based, no spawn) ─────────────────────
     predictor = AVAPredictorWorker(args)
@@ -184,7 +215,8 @@ def main() -> None:
         video_writer.show_progress(frame_idx)
 
     video_writer.close()
-    figure_saver.save()
+    if figure_saver is not None:
+        figure_saver.save()
     predictor.terminate()
     print("Done.")
 
